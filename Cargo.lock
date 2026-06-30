@@ -662,9 +662,9 @@ dependencies = [
 
 [[package]]
 name = "cyclors"
-version = "0.3.10"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec736c2dd53e4ab504b3b88376e2cde17d9db2eb616218db703ca115ab10f089"
+checksum = "6beb8dc0574f6e2184a2a67c6833ff7ab5b64a95d2459db9b009797b0bb7374e"
 dependencies = [
  "bincode",
  "bindgen",
@@ -2583,7 +2583,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4537,7 +4537,7 @@ dependencies = [
 
 [[package]]
 name = "zenoh-bridge-ros2dds"
-version = "1.9.0"
+version = "1.9.0-11-g17cbe4a"
 dependencies = [
  "async-liveliness-monitor",
  "clap",
@@ -4895,7 +4895,7 @@ dependencies = [
 
 [[package]]
 name = "zenoh-plugin-ros2dds"
-version = "1.9.0"
+version = "1.9.0-11-g17cbe4a"
 dependencies = [
  "async-trait",
  "bincode",
