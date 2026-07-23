@@ -26,7 +26,7 @@ use zenoh::{
     sample::{Locality, Sample},
     Wait,
 };
-use zenoh_ext::{AdvancedSubscriber, AdvancedSubscriberBuilderExt, HistoryConfig};
+use zenoh_ext::{AdvancedSubscriber, AdvancedSubscriberBuilderExt, HistoryConfig, RecoveryConfig};
 
 use crate::{
     dds_utils::{
@@ -34,12 +34,13 @@ use crate::{
         serialize_entity_guid,
     },
     liveliness_mgt::new_ke_liveliness_sub,
-    qos::{History, Qos},
+    qos::{History, HistoryKind, Qos},
     qos_helpers::is_transient_local,
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
     routes_mgr::Context,
     serialize_option_as_bool, vec_into_raw_parts, LOG_PAYLOAD,
 };
+use crate::config::{HistorySizeConfig, RecoverConfig};
 
 enum ZSubscriber {
     Subscriber(Subscriber<()>),
@@ -66,6 +67,8 @@ pub struct RouteSubscriber {
     // the local DDS Writer created to serve the route (i.e. re-publish to DDS message coming from zenoh)
     #[serde(serialize_with = "serialize_entity_guid")]
     dds_writer: dds_entity_t,
+    // if the Writer is reliable
+    reliable: bool,
     // if the Writer is TRANSIENT_LOCAL
     transient_local: bool,
     // queries timeout for historical publication (if TRANSIENT_LOCAL)
@@ -135,6 +138,33 @@ impl RouteSubscriber {
             writer_qos.reliability = None;
         }
 
+        let reliable = writer_qos.reliability.as_ref().is_some_and(|r| r.kind == cyclors::qos::ReliabilityKind::RELIABLE);
+
+        // adjust the history depth according to config overrides
+        if transient_local {
+            match context.config.get_sample_history_size(&ros2_name) {
+                HistorySizeConfig::Fixed(0) => {
+                    writer_qos.history = Some(History {
+                        kind: HistoryKind::KEEP_LAST,
+                        depth: 1,
+                    })
+                },
+                HistorySizeConfig::Fixed(n) => {
+                    writer_qos.history = Some(History {
+                        kind: HistoryKind::KEEP_LAST,
+                        depth: n.try_into().unwrap_or(i32::MAX),
+                    })
+                },
+                HistorySizeConfig::KeepAll => {
+                    writer_qos.history = Some(History {
+                        kind: HistoryKind::KEEP_ALL,
+                        depth: 0,
+                    })
+                },
+                HistorySizeConfig::Auto | HistorySizeConfig::Multiplier(_) => {}
+            }
+        }
+
         tracing::debug!(
             "Route Subscriber ({zenoh_key_expr} -> {ros2_name}): create Writer with {writer_qos:?}"
         );
@@ -157,6 +187,7 @@ impl RouteSubscriber {
             context,
             zenoh_subscriber: None,
             dds_writer,
+            reliable,
             transient_local,
             queries_timeout,
             keyless,
@@ -176,31 +207,81 @@ impl RouteSubscriber {
             route_zenoh_message_to_dds(s, &ros2_name, dds_writer);
         };
 
+        let recover_config = if self.reliable {
+            self.context.config.get_missed_sample_recovery(&self.ros2_name)
+        } else {
+            RecoverConfig::Off
+        };
+
         // create zenoh subscriber
-        // if Writer is TRANSIENT_LOCAL, use a QueryingSubscriber to fetch remote historical messages to write
-        self.zenoh_subscriber = if self.transient_local {
-            let history_config = match &discovered_reader_qos.history {
-                Some(History { depth, .. }) => {
-                    let depth: usize = (*depth).try_into().unwrap_or(usize::MAX);
-                    HistoryConfig::default()
-                        .detect_late_publishers()
-                        .max_samples(depth)
+        // if Writer is TRANSIENT_LOCAL or missed sample recovery is configured, use a
+        // QueryingSubscriber to fetch remote historical messages to write
+        self.zenoh_subscriber = if self.transient_local || recover_config != RecoverConfig::Off {
+
+            // Work out the history config
+            let history_config = if self.transient_local {
+                // We are transient local, so we need to work out the history size.
+                let history_size_config = self.context.config.get_sample_history_size(&self.ros2_name);
+                match history_size_config {
+                    HistorySizeConfig::Fixed(0) => None,
+                    HistorySizeConfig::Fixed(size) => Some(
+                        HistoryConfig::default()
+                            .max_samples(size)
+                            .detect_late_publishers()
+                    ),
+                    HistorySizeConfig::KeepAll => Some(
+                        HistoryConfig::default()
+                            .max_samples(usize::MAX)
+                            .detect_late_publishers()
+                    ),
+                    HistorySizeConfig::Auto | HistorySizeConfig::Multiplier(_) => {
+                        match &discovered_reader_qos.history {
+                            Some(History { depth, .. }) => {
+                                let depth: usize = (*depth).try_into().unwrap_or(usize::MAX);
+                                Some(
+                                    HistoryConfig::default()
+                                        .detect_late_publishers()
+                                        .max_samples(depth)
+                                )
+                            },
+                            _other => Some(HistoryConfig::default()
+                                .detect_late_publishers()
+                                .max_samples(1)),
+                        }
+                    }
                 }
-                _other => HistoryConfig::default()
-                    .detect_late_publishers()
-                    .max_samples(1),
+            } else {
+                // We are volatile, so keep the history config empty to disable history fetching.
+                None
             };
-            let sub = self
+
+            let recovery_config = match recover_config {
+                RecoverConfig::Off => None,
+                RecoverConfig::Heartbeat => Some(RecoveryConfig::default().heartbeat()),
+                RecoverConfig::Periodic(interval) => Some(RecoveryConfig::default().periodic_queries(Duration::from_micros((interval*1000_000.0) as u64))),
+            };
+
+            let mut sub_builder = self
                 .context
                 .zsession
                 .declare_subscriber(&self.zenoh_key_expr)
                 .advanced()
                 .callback(subscriber_callback)
                 .allowed_origin(Locality::Remote) // Allow only remote publications to avoid loops
-                .history(history_config)
-                .query_timeout(self.queries_timeout)
+                .query_timeout(self.queries_timeout);
+
+            if let Some(value) = history_config {
+                sub_builder = sub_builder.history(value);
+            }
+
+            if let Some(value) = recovery_config {
+                sub_builder = sub_builder.recovery(value);
+            }
+
+            let sub = sub_builder
                 .await
                 .map_err(|e| format!("{self}: failed to create FetchingSubscriber: {e}",))?;
+
             Some(ZSubscriber::AdvancedSubscriber(sub))
         } else {
             let sub = self

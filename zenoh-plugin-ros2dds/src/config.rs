@@ -12,7 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use std::{env, fmt, time::Duration};
-
+use std::any::TypeId;
 use regex::Regex;
 use serde::{de, de::Visitor, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 use tracing::warn;
@@ -31,6 +31,29 @@ pub const DEFAULT_QUERIES_TIMEOUT: f32 = 5.0;
 pub const DEFAULT_ACTION_GET_RESULT_TIMEOUT: f32 = 300.0;
 pub const DEFAULT_WORK_THREAD_NUM: usize = 2;
 pub const DEFAULT_MAX_BLOCK_THREAD_NUM: usize = 50;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum HeartbeatConfig {
+    Off,
+    Periodic(f32),
+    Sporadic(f32),
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum RecoverConfig {
+    Off,
+    Heartbeat,
+    Periodic(f32),
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum HistorySizeConfig {
+    Auto,
+    Fixed(usize),
+    Multiplier(usize),
+    KeepAll,
+}
+
 
 #[derive(Deserialize, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -54,8 +77,8 @@ pub struct Config {
     pub allowance: Option<Allowance>,
     #[serde(
         default,
-        deserialize_with = "deserialize_vec_regex_f32",
-        serialize_with = "serialize_vec_regex_f32"
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
     )]
     pub pub_max_frequencies: Vec<(Regex, f32)>,
     #[serde(default)]
@@ -65,14 +88,36 @@ pub struct Config {
     pub transient_local_cache_multiplier: usize,
     #[serde(default = "default_queries_timeout")]
     pub queries_timeout: Option<QueriesTimeouts>,
-    #[serde(default = "default_reliable_routes_blocking")]
-    pub reliable_routes_blocking: bool,
     #[serde(
         default,
-        deserialize_with = "deserialize_vec_regex_prio",
-        serialize_with = "serialize_vec_regex_prio"
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
+    )]
+    pub reliable_routes_blocking: Vec<(Regex, bool)>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
+    )]
+    pub topic_history_size: Vec<(Regex, HistorySizeConfig)>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
     )]
     pub pub_priorities: Vec<(Regex, (Priority, bool))>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
+    )]
+    pub pub_heartbeat: Vec<(Regex, HeartbeatConfig)>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
+    )]
+    pub missed_sample_recovery: Vec<(Regex, RecoverConfig)>,
     #[serde(default = "default_work_thread_num")]
     pub work_thread_num: usize,
     #[serde(default = "default_max_block_thread_num")]
@@ -186,6 +231,43 @@ impl Config {
             _ => Duration::from_secs_f32(DEFAULT_ACTION_GET_RESULT_TIMEOUT),
         }
     }
+
+    pub fn get_reliable_routes_blocking(&self, ros2_name: &str) -> bool {
+        for (re, value) in &self.reliable_routes_blocking {
+            if re.is_match(ros2_name) {
+                return *value;
+            }
+        }
+        DEFAULT_RELIABLE_ROUTES_BLOCKING
+    }
+
+    pub fn get_sample_history_size(&self, ros2_name: &str) -> HistorySizeConfig {
+        for (re, value) in &self.topic_history_size {
+            if re.is_match(ros2_name) {
+                return *value;
+            }
+        }
+        HistorySizeConfig::Auto
+    }
+
+    pub fn get_heartbeat(&self, ros2_name: &str) -> HeartbeatConfig {
+        for (re, value) in &self.pub_heartbeat {
+            if re.is_match(ros2_name) {
+                return *value;
+            }
+        }
+        HeartbeatConfig::Off
+    }
+
+    pub fn get_missed_sample_recovery(&self, ros2_name: &str) -> RecoverConfig {
+        for (re, value) in &self.missed_sample_recovery {
+            if re.is_match(ros2_name) {
+                return *value;
+            }
+        }
+        RecoverConfig::Off
+    }
+
 }
 
 #[derive(Deserialize, Debug, Serialize)]
@@ -195,14 +277,14 @@ pub struct QueriesTimeouts {
     default: f32,
     #[serde(
         default,
-        deserialize_with = "deserialize_vec_regex_f32",
-        serialize_with = "serialize_vec_regex_f32"
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
     )]
     transient_local_subscribers: Vec<(Regex, f32)>,
     #[serde(
         default,
-        deserialize_with = "deserialize_vec_regex_f32",
-        serialize_with = "serialize_vec_regex_f32"
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
     )]
     services: Vec<(Regex, f32)>,
     #[serde(default = "default_actions_timeout")]
@@ -214,20 +296,20 @@ pub struct QueriesTimeouts {
 pub struct ActionsTimeouts {
     #[serde(
         default,
-        deserialize_with = "deserialize_vec_regex_f32",
-        serialize_with = "serialize_vec_regex_f32"
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
     )]
     send_goal: Vec<(Regex, f32)>,
     #[serde(
         default,
-        deserialize_with = "deserialize_vec_regex_f32",
-        serialize_with = "serialize_vec_regex_f32"
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
     )]
     cancel_goal: Vec<(Regex, f32)>,
     #[serde(
         default = "default_actions_get_result_timeout",
-        deserialize_with = "deserialize_vec_regex_f32",
-        serialize_with = "serialize_vec_regex_f32"
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
     )]
     get_result: Vec<(Regex, f32)>,
 }
@@ -488,10 +570,6 @@ impl<'de> serde::de::Visitor<'de> for PathVisitor {
     }
 }
 
-fn default_reliable_routes_blocking() -> bool {
-    DEFAULT_RELIABLE_ROUTES_BLOCKING
-}
-
 #[derive(Deserialize, Debug, Serialize, Eq, PartialEq, Clone, Copy)]
 pub enum RosAutomaticDiscoveryRange {
     Subnet,
@@ -508,7 +586,7 @@ fn default_automatic_discovery_range() -> Option<RosAutomaticDiscoveryRange> {
     match env::var("ROS_AUTOMATIC_DISCOVERY_RANGE").as_deref() {
         Ok("SUBNET") => Some(RosAutomaticDiscoveryRange::Subnet),
         Ok("LOCALHOST") => Some(RosAutomaticDiscoveryRange::Localhost),
-        Ok("OFF") => Some(RosAutomaticDiscoveryRange::Localhost),
+        Ok("OFF") => Some(RosAutomaticDiscoveryRange::Off),
         Ok("SYSTEM_DEFAULT") => Some(RosAutomaticDiscoveryRange::SystemDefault),
         Ok(value) => {
             warn!(
@@ -526,13 +604,14 @@ fn deserialize_automatic_discovery_range<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let discovery_range: String = Deserialize::deserialize(deserializer).unwrap();
-    match discovery_range.as_str() {
-        "SUBNET" => Ok(Some(RosAutomaticDiscoveryRange::Subnet)),
-        "LOCALHOST" => Ok(Some(RosAutomaticDiscoveryRange::Localhost)),
-        "OFF" => Ok(Some(RosAutomaticDiscoveryRange::Off)),
-        "SYSTEM_DEFAULT" => Ok(Some(RosAutomaticDiscoveryRange::SystemDefault)),
-        unknown => Err(de::Error::custom(format!(
+    let discovery_range: Option<String> = Deserialize::deserialize(deserializer)?;
+    match discovery_range.as_deref() {
+        None => Ok(None),
+        Some("SUBNET") => Ok(Some(RosAutomaticDiscoveryRange::Subnet)),
+        Some("LOCALHOST") => Ok(Some(RosAutomaticDiscoveryRange::Localhost)),
+        Some("OFF") => Ok(Some(RosAutomaticDiscoveryRange::Off)),
+        Some("SYSTEM_DEFAULT") => Ok(Some(RosAutomaticDiscoveryRange::SystemDefault)),
+        Some(unknown) => Err(de::Error::custom(format!(
             r#"Invalid parameter "{unknown}" for ROS_AUTOMATICALLY_DISCOVERY_RANGE"#
         ))),
     }
@@ -542,17 +621,21 @@ fn deserialize_static_peers<'de, D>(deserializer: D) -> Result<Option<Vec<String
 where
     D: Deserializer<'de>,
 {
-    let peers: String = Deserialize::deserialize(deserializer).unwrap();
-    let mut peer_list: Vec<String> = Vec::new();
-    for peer in peers.split(';') {
-        if !peer.is_empty() {
-            peer_list.push(peer.to_owned());
+    let peers: Option<String> = Deserialize::deserialize(deserializer)?;
+    if let Some(peers) = peers {
+        let mut peer_list: Vec<String> = Vec::new();
+        for peer in peers.split(';') {
+            if !peer.is_empty() {
+                peer_list.push(peer.to_owned());
+            }
         }
-    }
-    if peer_list.is_empty() {
-        Ok(None)
+        if peer_list.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(peer_list))
+        }
     } else {
-        Ok(Some(peer_list))
+        Ok(None)
     }
 }
 
@@ -624,102 +707,263 @@ impl<'de> Visitor<'de> for RegexVisitor {
     }
 }
 
-fn deserialize_vec_regex_f32<'de, D>(deserializer: D) -> Result<Vec<(Regex, f32)>, D::Error>
+trait SerializableToConfigString: Sized {
+    const EXPECTED_FORMAT: &'static str;
+
+    fn from_config_string<E>(value: &str) -> Result<Self, E>
+    where
+        E: de::Error;
+
+    fn to_config_string(&self) -> String;
+}
+
+impl SerializableToConfigString for f32 {
+    const EXPECTED_FORMAT: &'static str = "<float>";
+
+    fn from_config_string<E>(value: &str) -> Result<Self, E>
+    where
+        E: de::Error,
+    {
+        let value: f32 = value
+            .parse()
+            .map_err(|e| de::Error::custom(format!("Invalid float '{value}': {e}")))?;
+        Ok(value)
+    }
+
+    fn to_config_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl SerializableToConfigString for bool {
+    const EXPECTED_FORMAT: &'static str = "true|false";
+
+    fn from_config_string<E>(value: &str) -> Result<Self, E>
+    where
+        E: de::Error,
+    {
+        match value {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(de::Error::custom(format!(
+                "Invalid boolean value '{value}': expected 'true' or 'false'"
+            ))),
+        }
+    }
+
+    fn to_config_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl SerializableToConfigString for (Priority, bool) {
+    const EXPECTED_FORMAT: &'static str = "<int>[:express]";
+
+    fn from_config_string<E>(value: &str) -> Result<Self, E>
+    where
+        E: de::Error,
+    {
+        let (priority, suffix) = match value.find(":") {
+            None => { (value, "") }
+            Some(index) => { (&value[..index], &value[index+1..]) }
+        };
+        let priority: u8 = priority.parse().map_err(|e| {
+            de::Error::custom(format!(
+                "Invalid priority in '{value}': {e}"
+            ))
+        })?;
+        let priority = Priority::try_from(priority)
+            .map_err(|e| de::Error::custom(format!("Invalid priority in '{value}': {e}")))?;
+
+        let express = match suffix {
+            "" => false,
+            "express" => true,
+            _ => return Err(de::Error::custom(format!("Invalid priority suffix '{suffix}' in '{value}'"))),
+        };
+        Ok((priority, express))
+    }
+
+    fn to_config_string(&self) -> String {
+        if self.1 {
+            format!("{}:express", self.0 as u8)
+        } else {
+            (self.0 as u8).to_string()
+        }
+    }
+}
+
+impl SerializableToConfigString for HeartbeatConfig {
+    const EXPECTED_FORMAT: &'static str = "off|<period>[:sporadic]";
+
+    fn from_config_string<E>(value: &str) -> Result<Self, E>
+    where
+        E: de::Error,
+    {
+        if value == "off" {
+            return Ok(HeartbeatConfig::Off);
+        }
+
+        let (interval, suffix) = match value.find(":") {
+            None => { (value, "") }
+            Some(index) => { (&value[..index], &value[index+1..]) }
+        };
+        let interval: f32 = interval.parse()
+            .map_err(|e| {
+                de::Error::custom(format!("Invalid duration in '{value}': {e}"))
+            })?;
+
+        if !interval.is_finite() || interval <= 0.0 {
+            return Err(de::Error::custom(format!(
+                "Invalid heartbeat interval '{value}': expected a finite value > 0, got {interval}"
+            )));
+        }
+
+        match suffix {
+            "" => Ok(HeartbeatConfig::Periodic(interval)),
+            "sporadic" => Ok(HeartbeatConfig::Sporadic(interval)),
+            _ => Err(de::Error::custom(format!("Invalid heartbeat suffix '{suffix}' in '{value}'"))),
+        }
+    }
+
+    fn to_config_string(&self) -> String {
+        match self {
+            HeartbeatConfig::Off => "off".to_string(),
+            HeartbeatConfig::Periodic(interval) => interval.to_string(),
+            HeartbeatConfig::Sporadic(interval) => format!("{interval}:sporadic"),
+        }
+    }
+}
+
+impl SerializableToConfigString for RecoverConfig {
+    const EXPECTED_FORMAT: &'static str = "off|heartbeat|<frequency>";
+
+    fn from_config_string<E>(value: &str) -> Result<Self, E>
+    where
+        E: de::Error,
+    {
+        match value {
+            "off" => Ok(RecoverConfig::Off),
+            "heartbeat" => Ok(RecoverConfig::Heartbeat),
+            _ => {
+                let period: f32 = value
+                    .parse()
+                    .map_err(|e| de::Error::custom(format!("Invalid heartbeat frequency '{value}': {e}")))?;
+
+                if !period.is_finite() || period <= 0.0 {
+                    return Err(de::Error::custom(format!(
+                        "Invalid recovery period '{value}': expected a finite value > 0, got {period}"
+                    )));
+                }
+
+                Ok(RecoverConfig::Periodic(period))
+            }
+        }
+    }
+
+    fn to_config_string(&self) -> String {
+        match self {
+            RecoverConfig::Off => "false".to_string(),
+            RecoverConfig::Heartbeat => "heartbeat".to_string(),
+            RecoverConfig::Periodic(f) => f.to_string(),
+        }
+    }
+}
+
+impl SerializableToConfigString for HistorySizeConfig {
+    const EXPECTED_FORMAT: &'static str = "default|<size>|<multiplier>x|keepall";
+
+    fn from_config_string<E>(value: &str) -> Result<Self, E>
+    where
+        E: de::Error,
+    {
+        match value {
+            "auto" => Ok(HistorySizeConfig::Auto),
+            "keepall" => Ok(HistorySizeConfig::KeepAll),
+            _ => {
+                if let Some(multiplier) = value.strip_suffix("x") {
+                    let multiplier: usize = multiplier
+                        .parse()
+                        .map_err(|e| de::Error::custom(format!("Invalid multiplier '{multiplier}': {e}")))?;
+
+                    Ok(HistorySizeConfig::Multiplier(multiplier))
+                } else {
+                    let size: usize = value
+                        .parse()
+                        .map_err(|e| de::Error::custom(format!("Invalid history size '{value}': {e}")))?;
+                    Ok(HistorySizeConfig::Fixed(size))
+                }
+            }
+        }
+    }
+
+    fn to_config_string(&self) -> String {
+        match self {
+            HistorySizeConfig::Auto => "auto".to_string(),
+            HistorySizeConfig::Fixed(size) => size.to_string(),
+            HistorySizeConfig::Multiplier(multiplier) => format!("{multiplier}x"),
+            HistorySizeConfig::KeepAll => "keepall".to_string(),
+        }
+    }
+}
+
+fn deserialize_vec_regex<'de, D, T: SerializableToConfigString + 'static>(deserializer: D) -> Result<Vec<(Regex, T)>, D::Error>
 where
     D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum AcceptedValues {
-        Float(f32),
+        Simple(String),
         List(Vec<String>),
+        Direct(serde_json::Value), // fallback to handle types that aren't written as quoted string.
     }
 
-    let values: AcceptedValues = Deserialize::deserialize(deserializer).unwrap();
+    let mut values: AcceptedValues = Deserialize::deserialize(deserializer)?;
+    if let AcceptedValues::Direct(value) = values {
+        values = AcceptedValues::Simple(value.to_string());
+    }
     match values {
-        AcceptedValues::Float(f) => {
-            // same float for any string (i.e. matching ".*")
-            Ok(vec![(Regex::new(".*").unwrap(), f)])
+        AcceptedValues::Simple(value) => {
+            let value = T::from_config_string::<D::Error>(&value)
+                .map_err(|e| de::Error::custom(
+                    format!("Invalid value in '{value}' (expected: '{})': {e}", T::EXPECTED_FORMAT)
+                ))?;
+            Ok(vec![(Regex::new(".*").unwrap(), value)])
         }
-        AcceptedValues::List(strs) => {
-            let mut result: Vec<(Regex, f32)> = Vec::with_capacity(strs.len());
-            for s in strs {
-                let i = s.find('=').ok_or_else(|| {
-                    de::Error::custom(format!(
-                        r#"Invalid list of "<regex>=<float>" elements": {s}"#
-                    ))
-                })?;
-                let regex = Regex::new(&s[0..i])
-                    .map_err(|e| de::Error::custom(format!("Invalid regex in '{s}': {e}")))?;
-                let frequency: f32 = s[i + 1..]
-                    .parse()
-                    .map_err(|e| de::Error::custom(format!("Invalid float value in '{s}': {e}")))?;
-                result.push((regex, frequency));
+        AcceptedValues::List(values) => {
+            let mut result: Vec<(Regex, T)> = Vec::with_capacity(values.len());
+            for item in values {
+                let (regex, value) = match item.find("=") {
+                    None => {
+                        if TypeId::of::<T>() == TypeId::of::<bool>() {
+                            (item.as_str(), "true")
+                        } else {
+                            return Err(de::Error::custom(format!("Invalid value in '{item}' (expected: '[regex=]{})': Missing '='", T::EXPECTED_FORMAT)))
+                        }
+                    }
+                    Some(i) => { (&item[0..i], &item[i + 1..]) }
+                };
+                let regex = Regex::new(regex)
+                    .map_err(|e| de::Error::custom(format!("Invalid regex in '{item}': {e}")))?;
+                let value = T::from_config_string::<D::Error>(value)
+                    .map_err(|e| de::Error::custom(
+                        format!("Invalid value in '{item}' (expected: '[regex=]{})': {e}", T::EXPECTED_FORMAT)
+                    ))?;
+                result.push((regex, value));
             }
             Ok(result)
         }
+        AcceptedValues::Direct(_) => unreachable!(),
     }
 }
 
-fn serialize_vec_regex_f32<S>(v: &Vec<(Regex, f32)>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_vec_regex<S, T: SerializableToConfigString>(v: &Vec<(Regex, T)>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     let mut seq = serializer.serialize_seq(Some(v.len()))?;
-    for (r, f) in v {
-        let s = format!("{}={}", r.as_str(), f);
-        seq.serialize_element(&s)?;
-    }
-    seq.end()
-}
-
-#[allow(clippy::type_complexity)]
-fn deserialize_vec_regex_prio<'de, D>(
-    deserializer: D,
-) -> Result<Vec<(Regex, (Priority, bool))>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let strs: Vec<String> = Deserialize::deserialize(deserializer).unwrap();
-    let mut result: Vec<(Regex, (Priority, bool))> = Vec::with_capacity(strs.len());
-    for s in strs {
-        let i = s.find('=').ok_or_else(|| {
-            de::Error::custom(format!(
-                r#"Invalid list of "<regex>=<int>[:express]" elements": {s}"#
-            ))
-        })?;
-        let regex = Regex::new(&s[0..i])
-            .map_err(|e| de::Error::custom(format!("Invalid regex in '{s}': {e}")))?;
-        let (prio_str, is_express) = match s[i + 1..].strip_suffix(":express") {
-            Some(prio_str) => (prio_str, true),
-            None => (&s[i + 1..], false),
-        };
-        let i: u8 = prio_str.parse().map_err(|e| {
-            de::Error::custom(format!(
-                "Invalid priority (format is not <int>[:express]) in '{s}': {e}"
-            ))
-        })?;
-        let priority = Priority::try_from(i)
-            .map_err(|e| de::Error::custom(format!("Invalid priority in '{s}': {e}")))?;
-        result.push((regex, (priority, is_express)));
-    }
-    Ok(result)
-}
-
-fn serialize_vec_regex_prio<S>(
-    v: &Vec<(Regex, (Priority, bool))>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let mut seq = serializer.serialize_seq(Some(v.len()))?;
-    for (r, (p, is_express)) in v {
-        let s = if *is_express {
-            format!("{}={}:express", r.as_str(), *p as u8)
-        } else {
-            format!("{}={}", r.as_str(), *p as u8)
-        };
+    for (regex, value) in v {
+        let s = format!("{}={}", regex.as_str(), value.to_config_string());
         seq.serialize_element(&s)?;
     }
     seq.end()
@@ -736,7 +980,7 @@ where
 mod tests {
     use test_case::test_case;
 
-    use super::{Config, RosAutomaticDiscoveryRange};
+    use super::{Config, RosAutomaticDiscoveryRange, HeartbeatConfig};
 
     #[test]
     fn test_allowance() {
@@ -985,5 +1229,163 @@ mod tests {
             ros_static_peers, ..
         } = config.unwrap();
         assert_eq!(ros_static_peers, result);
+    }
+
+
+    #[test]
+    fn test_deserialize_vec_regex_f32_from_single_value() {
+        let config = serde_json::from_str::<Config>(
+            r#"{
+                "pub_max_frequencies": "42.5"
+            }"#,
+        )
+            .unwrap();
+
+        assert_eq!(config.pub_max_frequencies.len(), 1);
+        assert_eq!(config.pub_max_frequencies[0].0.as_str(), ".*");
+        assert_eq!(config.pub_max_frequencies[0].1, 42.5);
+    }
+
+    #[test]
+    fn test_deserialize_vec_regex_f32_from_list() {
+        let config = serde_json::from_str::<Config>(
+            r#"{
+                "pub_max_frequencies": [
+                    "/foo/.*=10.0",
+                    "/bar=5.5"
+                ]
+            }"#,
+        )
+            .unwrap();
+
+        assert_eq!(config.pub_max_frequencies.len(), 2);
+
+        assert_eq!(config.pub_max_frequencies[0].0.as_str(), "/foo/.*");
+        assert_eq!(config.pub_max_frequencies[0].1, 10.0);
+
+        assert_eq!(config.pub_max_frequencies[1].0.as_str(), "/bar");
+        assert_eq!(config.pub_max_frequencies[1].1, 5.5);
+    }
+
+    #[test]
+    fn test_deserialize_vec_regex_heartbeat_from_single_value_without_regex() {
+        let config = serde_json::from_str::<Config>(
+            r#"{
+                "pub_heartbeat": "1.5:sporadic"
+            }"#,
+        )
+            .unwrap();
+
+        assert_eq!(config.pub_heartbeat.len(), 1);
+        assert_eq!(config.pub_heartbeat[0].0.as_str(), ".*");
+        assert_eq!(
+            config.pub_heartbeat[0].1,
+            HeartbeatConfig::Sporadic(1.5)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_vec_regex_heartbeat_from_list() {
+        let config = serde_json::from_str::<Config>(
+            r#"{
+                "pub_heartbeat": [
+                    "/foo/.*=off",
+                    "/bar=0.1:sporadic",
+                    "/baz=2.5"
+                ]
+            }"#,
+        )
+            .unwrap();
+
+        assert_eq!(config.pub_heartbeat.len(), 3);
+
+        assert_eq!(config.pub_heartbeat[0].0.as_str(), "/foo/.*");
+        assert_eq!(config.pub_heartbeat[0].1, HeartbeatConfig::Off);
+
+        assert_eq!(config.pub_heartbeat[1].0.as_str(), "/bar");
+        assert_eq!(
+            config.pub_heartbeat[1].1,
+            HeartbeatConfig::Sporadic(0.1)
+        );
+
+        assert_eq!(config.pub_heartbeat[2].0.as_str(), "/baz");
+        assert_eq!(
+            config.pub_heartbeat[2].1,
+            HeartbeatConfig::Periodic(2.5)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_vec_regex_rejects_invalid_regex() {
+        let err = serde_json::from_str::<Config>(
+            r#"{
+                "pub_max_frequencies": [
+                    "[invalid=10.0"
+                ]
+            }"#,
+        )
+            .unwrap_err();
+
+        let err = err.to_string();
+        assert!(err.contains("Invalid regex"), "{err}");
+    }
+
+    #[test]
+    fn test_deserialize_vec_regex_rejects_invalid_value() {
+        let err = serde_json::from_str::<Config>(
+            r#"{
+                "pub_max_frequencies": [
+                    "/foo=not-a-float"
+                ]
+            }"#,
+        )
+            .unwrap_err();
+
+        let err = err.to_string();
+        assert!(err.contains("Invalid value"), "{err}");
+        assert!(err.contains("/foo=not-a-float"), "{err}");
+    }
+
+    #[test]
+    fn test_deserialize_vec_regex_heartbeat_rejects_zero_frequency() {
+        let err = serde_json::from_str::<Config>(
+            r#"{
+                "pub_heartbeat": [
+                    "/foo=0.0"
+                ]
+            }"#,
+        )
+            .unwrap_err();
+
+        let err = err.to_string();
+        assert!(err.contains("expected a finite value > 0"), "{err}");
+    }
+
+    #[test]
+    fn test_serialize_vec_regex_heartbeat_roundtrip() {
+        let input = r#"{
+            "pub_heartbeat": [
+                "/foo=off",
+                "/bar=1:sporadic",
+                "/baz=2"
+            ]
+        }"#;
+
+        let config = serde_json::from_str::<Config>(input).unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+        let reparsed = serde_json::from_str::<Config>(&json).unwrap();
+
+        assert_eq!(
+            reparsed.pub_heartbeat[0].1,
+            HeartbeatConfig::Off
+        );
+        assert_eq!(
+            reparsed.pub_heartbeat[1].1,
+            HeartbeatConfig::Sporadic(1.)
+        );
+        assert_eq!(
+            reparsed.pub_heartbeat[2].1,
+            HeartbeatConfig::Periodic(2.)
+        );
     }
 }

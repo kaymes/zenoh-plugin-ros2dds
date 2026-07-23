@@ -254,6 +254,50 @@ Deploying a `zenoh-bridge-ros2dds` in each robot and configuring each with its o
 
 NOTE: the bridge prefixes ALL topics/services/actions names with the configured namespace, including `/rosout`, `/parameter_events`, `/tf` and `/tf_static`.
 
+## Quality of service (QoS) settings
+
+Zenoh and DDS have different quality of service (QoS) concepts which don't always map one-to-one between the two worlds.
+Thus, when bridging DDS entities with the `zenoh-bridge-ros2dds`, some subtle differences in behaviour may arise.
+
+The bridge attempts to set up its DDS publishers and subscribers as well as the internal Zenoh transports to match the 
+QoS settings observed in the DDS entities. However, if different DDS entities for the same topic have different QoS 
+settings, the bridge usually mimics the QoS of whatever entity it sees first. To get a consistent behaviour of the bridge
+it is recommended to ensure all ROS 2 entities that publish or subscribe to a topic use identical QoS settings.
+
+Zenoh's native QoS concepts are:
+- reliable / best-effort: this selection governs whether a message is passed through a reliable network link (typically tcp)
+  or an unreliable one (typically udp). This distinction only matters if multiple network links are configured. If, for 
+  example, only a tcp route exists, it will be used for unreliable traffic, too.
+- congestion control Drop / Block: this selection governs how the Zenoh router handles congestion. If set to `Drop`, messages 
+  are dropped when the router fails to find space for them in a suitable transport queue within a veryh short timeframe 
+  (typically 1ms). `Block` means that the bridge will block accepting new messages until space becomes available, thus  
+  building up backpressure along the route all the way to the source. However, if a message with congestion control `Block`
+  can't be placed in a suitable transport queue within some time (typically 5 seconds), a Zenoh router will sever the 
+  network connection to prevent the source of the message as there is no other way to reject a non-droppable message.
+  
+In addition, the Zenoh API provides so-called Advanced Publishers and Advanced Subscribers. These hold a cache of past
+samples on a topic and allow the detection of missed samples using heartbeat messages or periodic queries. 
+`zenoh-bridge-ros2dds` also uses this cache to mimic the `transient_local` QoS behaviour of Ros.
+
+The default of `zenoh-bridge-ros2dds` is to map reliable ROS topis to Zenoh's reliable transport and congestion control 
+`Block` whereas best effort ROS topics are mapped to Zenoh's best effort transport and congestion control `Drop`. This 
+is the closest match to the DDS behaviour.
+
+Congestion control `Block` is expected to work well in local area network (LAN) settings where the underlying network is
+failry reliable with a predictable bandwidth. However, if the underlying network is unreliable with inconsistent bandwith
+availability, congestion on one link of a route of the Zenoh network can build up backpressure that affects the throughput 
+of otherwise unrelated routes. Furthermore, if congestion causes Zenoh routers to sever their connection, all traffic 
+between the affected routers ceases until the connection is restored. Thus, when operating `zenoh-bridge-ros2dds` on wide
+area networks (WAN), one may consider using congestion control `Drop` for reliable ROS topics while employing one of the
+reliability mechanisms provided by the Advanced Publisher / Subscriber API as a compromise if the network isn't suitable
+for truely reliable semantics.
+
+
+
+
+
+
+
 ## Admin space
 
 The bridge exposes some internal states via a Zenoh admin space under `@/<id>/ros2/**`, where `<id>` is the unique Zenoh ID of the bridge (configurable).  

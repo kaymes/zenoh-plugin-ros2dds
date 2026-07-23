@@ -32,7 +32,7 @@ use zenoh::{
     sample::Locality,
     Wait,
 };
-use zenoh_ext::{AdvancedPublisher, AdvancedPublisherBuilderExt, CacheConfig};
+use zenoh_ext::{AdvancedPublisher, AdvancedPublisherBuilderExt, CacheConfig, MissDetectionConfig};
 
 use crate::{
     dds_types::{DDSRawSample, TypeInfo},
@@ -47,6 +47,7 @@ use crate::{
     routes_mgr::Context,
     Config, LOG_PAYLOAD,
 };
+use crate::config::{HeartbeatConfig, HistorySizeConfig};
 
 pub struct ZPublisher {
     publisher: Arc<AdvancedPublisher<'static>>,
@@ -139,45 +140,78 @@ impl RoutePublisher {
         );
 
         // create the zenoh Publisher
-        // if Reader shall be TRANSIENT_LOCAL, use a PublicationCache to store historical messages
-        let transient_local: bool = is_transient_local(&reader_qos);
-        let cache_size: usize = if transient_local {
-            #[allow(non_upper_case_globals)]
-            let history_qos = get_history_or_default(&reader_qos);
-            let durability_service_qos = get_durability_service_or_default(&reader_qos);
-            let mut history = match (history_qos.kind, history_qos.depth) {
-                (HistoryKind::KEEP_LAST, n) => {
-                    if keyless {
-                        // only 1 instance => history=n
-                        n as usize
-                    } else if durability_service_qos.max_instances == DDS_LENGTH_UNLIMITED {
-                        // No limit! => history=MAX
-                        usize::MAX
-                    } else if durability_service_qos.max_instances > 0 {
-                        // Compute cache size as history.depth * durability_service.max_instances
-                        // This makes the assumption that the frequency of publication is the same for all instances...
-                        // But as we have no way to have 1 cache per-instance, there is no other choice.
-                        n.saturating_mul(durability_service_qos.max_instances) as usize
-                    } else {
-                        n as usize
+        // if Reader is TRANSIENT_LOCAL or reliable, use a PublicationCache to store historical messages
+        let (cache_size, cache_size_reason) = if is_transient_local(&reader_qos) || is_reliable(&reader_qos) {
+            let history_size_config = context.config.get_sample_history_size(&ros2_name);
+            match history_size_config {
+                HistorySizeConfig::Fixed(0) => (0 as usize, "explicitly disabled".to_string()),
+                HistorySizeConfig::Fixed(n) => (n as usize, "configured to fixed size".to_string()),
+                HistorySizeConfig::KeepAll => (usize::MAX, "configured keep all".to_string()),
+                HistorySizeConfig::Multiplier(_) | HistorySizeConfig::Auto => {
+                    #[allow(non_upper_case_globals)]
+                    let history_qos = get_history_or_default(&reader_qos);
+                    let durability_service_qos = get_durability_service_or_default(&reader_qos);
+                    let mut history = match (history_qos.kind, history_qos.depth) {
+                        (HistoryKind::KEEP_LAST, n) => {
+                            if keyless {
+                                // only 1 instance => history=n
+                                n as usize
+                            } else if durability_service_qos.max_instances == DDS_LENGTH_UNLIMITED {
+                                // No limit! => history=MAX
+                                usize::MAX
+                            } else if durability_service_qos.max_instances > 0 {
+                                // Compute cache size as history.depth * durability_service.max_instances
+                                // This makes the assumption that the frequency of publication is the same for all instances...
+                                // But as we have no way to have 1 cache per-instance, there is no other choice.
+                                n.saturating_mul(durability_service_qos.max_instances) as usize
+                            } else {
+                                n as usize
+                            }
+                        }
+                        (HistoryKind::KEEP_ALL, _) => usize::MAX,
+                    };
+                    // In case there are several Writers served by this route, increase the cache size
+                    match history_size_config {
+                        HistorySizeConfig::Multiplier(cache_multiplier) => {
+                            history = history.saturating_mul(cache_multiplier);
+                        },
+                        HistorySizeConfig::Auto => {
+                            history = history.saturating_mul(context.config.transient_local_cache_multiplier);
+                        },
+                        _ => unreachable!(),
                     }
+                    (history, format!("computed from Reader's QoS: history=({:?},{}), durability_service.max_instances={}", history_qos.kind, history_qos.depth, durability_service_qos.max_instances))
                 }
-                (HistoryKind::KEEP_ALL, _) => usize::MAX,
-            };
-            // In case there are several Writers served by this route, increase the cache size
-            history = history.saturating_mul(context.config.transient_local_cache_multiplier);
-            tracing::debug!(
-                "Route Publisher ({ros2_name} -> {zenoh_key_expr}): caching TRANSIENT_LOCAL publications with history={history} (computed from Reader's QoS: history=({:?},{}), durability_service.max_instances={})",
-                history_qos.kind, history_qos.depth, durability_service_qos.max_instances
-            );
-            history
+            }
         } else {
-            0
+            (0, "volatile and best effort".to_string())
         };
+
+        let (miss_detection_config, miss_detection_explanation) = if is_reliable(&reader_qos) {
+            if cache_size > 0 {
+                match context.config.get_heartbeat(&ros2_name) {
+                    HeartbeatConfig::Off => (None, "heartbeat disabled".to_string()),
+                    HeartbeatConfig::Periodic(interval) => (
+                        Some(MissDetectionConfig::default().heartbeat(Duration::from_micros((interval * 1e6) as u64))),
+                        format!("periodic heartbeat every {interval} seconds")
+                    ),
+                    HeartbeatConfig::Sporadic(interval) => (
+                        Some(MissDetectionConfig::default().sporadic_heartbeat(Duration::from_micros((interval * 1e6) as u64))),
+                        format!("sporadic heartbeat at most every {interval} seconds")
+                    ),
+                }
+            } else {
+                (None, "".to_string())
+            }
+        } else {
+            (None, "".to_string())
+        };
+
+        tracing::debug!("Route Publisher ({ros2_name} -> {zenoh_key_expr}): history size: {cache_size} samples ({cache_size_reason}) {miss_detection_explanation}");
 
         // CongestionControl to be used when re-publishing over zenoh: Blocking if Writer is RELIABLE (since we don't know what is remote Reader's QoS)
         let congestion_ctrl = match (
-            context.config.reliable_routes_blocking,
+            context.config.get_reliable_routes_blocking(&ros2_name),
             is_reliable(&reader_qos),
         ) {
             (true, true) => CongestionControl::Block,
@@ -200,10 +234,13 @@ impl RoutePublisher {
             .zsession
             .declare_publisher(zenoh_key_expr.clone())
             .advanced();
-        if transient_local {
+        if cache_size > 0 {
             publisher_builder = publisher_builder
                 .cache(CacheConfig::default().max_samples(cache_size))
                 .publisher_detection();
+        }
+        if let Some(miss_detection_config) = miss_detection_config {
+            publisher_builder = publisher_builder.sample_miss_detection(miss_detection_config);
         }
 
         let publisher: Arc<AdvancedPublisher<'static>> = Arc::new(

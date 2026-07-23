@@ -172,6 +172,23 @@ impl Plugin for ROS2Plugin {
             .get_plugin_config(name)
             .map_err(|_| zerror!("Plugin `{}`: missing config", name))?;
         let config: Config = serde_json::from_value(plugin_conf.clone())
+            .map_err(|e| {
+                // Let's attempt to print to the user a hint for where the configuration failed to parse
+                // We don't have access to the original config text, so the best we can do is to
+                // pretty-print the JSON and then parse it again to and show where it failed.
+                if let Ok(plugin_conf_text) = serde_json::to_string_pretty(&plugin_conf) {
+                    if let Err(error) = serde_json::from_str::<Config>(&plugin_conf_text) {
+                        if let Some(failed_line) = plugin_conf_text
+                            .lines()
+                            .nth(error.line().saturating_sub(1)) {
+                                tracing::error!(
+                                "{e}\nFailed config:\n{failed_line}\n{}^",
+                                " ".repeat(error.column().saturating_sub(1))
+                            );
+                        }
+                    }
+                }
+                e})
             .map_err(|e| zerror!("Plugin `{}` configuration error: {}", name, e))?;
         WORK_THREAD_NUM.store(config.work_thread_num, Ordering::SeqCst);
         MAX_BLOCK_THREAD_NUM.store(config.max_block_thread_num, Ordering::SeqCst);
