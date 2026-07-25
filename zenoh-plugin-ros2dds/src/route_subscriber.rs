@@ -40,7 +40,7 @@ use crate::{
     routes_mgr::Context,
     serialize_option_as_bool, vec_into_raw_parts, LOG_PAYLOAD,
 };
-use crate::config::{HistorySizeConfig, RecoverConfig};
+use crate::config::{HistorySizeConfig, RecoverConfig, ReliabilityOverride};
 
 enum ZSubscriber {
     Subscriber(Subscriber<()>),
@@ -138,7 +138,11 @@ impl RouteSubscriber {
             writer_qos.reliability = None;
         }
 
-        let reliable = writer_qos.reliability.as_ref().is_some_and(|r| r.kind == cyclors::qos::ReliabilityKind::RELIABLE);
+        let reliable = match context.config.get_reliability_override(&ros2_name) {
+            ReliabilityOverride::Reliable => true,
+            ReliabilityOverride::BestEffort => false,
+            ReliabilityOverride::Auto => writer_qos.reliability.as_ref().is_some_and(|r| r.kind == cyclors::qos::ReliabilityKind::RELIABLE)
+        };
 
         // adjust the history depth according to config overrides
         if transient_local {

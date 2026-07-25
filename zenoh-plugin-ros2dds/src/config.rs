@@ -32,6 +32,16 @@ pub const DEFAULT_ACTION_GET_RESULT_TIMEOUT: f32 = 300.0;
 pub const DEFAULT_WORK_THREAD_NUM: usize = 2;
 pub const DEFAULT_MAX_BLOCK_THREAD_NUM: usize = 50;
 
+
+
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum ReliabilityOverride {
+    Auto,
+    BestEffort,
+    Reliable,
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum HeartbeatConfig {
     Off,
@@ -94,6 +104,12 @@ pub struct Config {
         serialize_with = "serialize_vec_regex"
     )]
     pub reliable_routes_blocking: Vec<(Regex, bool)>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
+    )]
+    pub reliability_override: Vec<(Regex, ReliabilityOverride)>,
     #[serde(
         default,
         deserialize_with = "deserialize_vec_regex",
@@ -239,6 +255,15 @@ impl Config {
             }
         }
         DEFAULT_RELIABLE_ROUTES_BLOCKING
+    }
+
+    pub fn get_reliability_override(&self, ros2_name: &str) -> ReliabilityOverride {
+        for (re, value) in &self.reliability_override {
+            if re.is_match(ros2_name) {
+                return *value;
+            }
+        }
+        ReliabilityOverride::Auto
     }
 
     pub fn get_sample_history_size(&self, ros2_name: &str) -> HistorySizeConfig {
@@ -789,6 +814,31 @@ impl SerializableToConfigString for (Priority, bool) {
         } else {
             (self.0 as u8).to_string()
         }
+    }
+}
+
+impl SerializableToConfigString for ReliabilityOverride {
+    const EXPECTED_FORMAT: &'static str = "off|<period>[:sporadic]";
+
+    fn from_config_string<E>(value: &str) -> Result<Self, E>
+    where
+        E: de::Error,
+    {
+        match value {
+            "auto" => Ok(ReliabilityOverride::Auto),
+            "best-effort" => Ok(ReliabilityOverride::BestEffort),
+            "reliable" => Ok(ReliabilityOverride::Reliable),
+            _ => Err(de::Error::custom(format!("Invalid reliability specification: '{value}'"))),
+        }
+    }
+
+    fn to_config_string(&self) -> String {
+        match self {
+            ReliabilityOverride::Auto => "auto",
+            ReliabilityOverride::BestEffort => "best-effort",
+            ReliabilityOverride::Reliable => "reliable",
+        }
+        .to_string()
     }
 }
 

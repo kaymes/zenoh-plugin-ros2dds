@@ -47,7 +47,7 @@ use crate::{
     routes_mgr::Context,
     Config, LOG_PAYLOAD,
 };
-use crate::config::{HeartbeatConfig, HistorySizeConfig};
+use crate::config::{HeartbeatConfig, HistorySizeConfig, ReliabilityOverride};
 
 pub struct ZPublisher {
     publisher: Arc<AdvancedPublisher<'static>>,
@@ -139,9 +139,15 @@ impl RoutePublisher {
             "Route Publisher ({ros2_name} -> {zenoh_key_expr}): creation with type {ros2_type}"
         );
 
+        let route_is_reliable = match context.config.get_reliability_override(&ros2_name) {
+            ReliabilityOverride::Reliable => true,
+            ReliabilityOverride::BestEffort => false,
+            ReliabilityOverride::Auto => is_reliable(&reader_qos)
+        };
+
         // create the zenoh Publisher
         // if Reader is TRANSIENT_LOCAL or reliable, use a PublicationCache to store historical messages
-        let (cache_size, cache_size_reason) = if is_transient_local(&reader_qos) || is_reliable(&reader_qos) {
+        let (cache_size, cache_size_reason) = if is_transient_local(&reader_qos) || route_is_reliable {
             let history_size_config = context.config.get_sample_history_size(&ros2_name);
             match history_size_config {
                 HistorySizeConfig::Fixed(0) => (0 as usize, "explicitly disabled".to_string()),
@@ -187,7 +193,7 @@ impl RoutePublisher {
             (0, "volatile and best effort".to_string())
         };
 
-        let (miss_detection_config, miss_detection_explanation) = if is_reliable(&reader_qos) {
+        let (miss_detection_config, miss_detection_explanation) = if route_is_reliable {
             if cache_size > 0 {
                 match context.config.get_heartbeat(&ros2_name) {
                     HeartbeatConfig::Off => (None, "heartbeat disabled".to_string()),
@@ -212,7 +218,7 @@ impl RoutePublisher {
         // CongestionControl to be used when re-publishing over zenoh: Blocking if Writer is RELIABLE (since we don't know what is remote Reader's QoS)
         let congestion_ctrl = match (
             context.config.get_reliable_routes_blocking(&ros2_name),
-            is_reliable(&reader_qos),
+            route_is_reliable,
         ) {
             (true, true) => CongestionControl::Block,
             _ => CongestionControl::Drop,
