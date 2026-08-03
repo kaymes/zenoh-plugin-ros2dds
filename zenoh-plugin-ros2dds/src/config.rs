@@ -719,6 +719,7 @@ impl<'de> Visitor<'de> for RegexVisitor {
     {
         let mut vec: Vec<String> = Vec::new();
         while let Some(s) = seq.next_element::<String>()? {
+            let s = s.strip_prefix("^").unwrap_or(&s).strip_suffix("$").unwrap_or(&s);
             vec.push(format!("^{s}$"));
         }
         if vec.is_empty() {
@@ -993,7 +994,8 @@ where
                     }
                     Some(i) => { (&item[0..i], &item[i + 1..]) }
                 };
-                let regex = Regex::new(regex)
+                let regex = regex.strip_prefix("^").unwrap_or(&regex).strip_suffix("$").unwrap_or(&regex);
+                let regex = Regex::new(&format!("^{regex}$"))
                     .map_err(|e| de::Error::custom(format!("Invalid regex in '{item}': {e}")))?;
                 let value = T::from_config_string::<D::Error>(value)
                     .map_err(|e| de::Error::custom(
