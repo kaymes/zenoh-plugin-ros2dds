@@ -127,6 +127,14 @@ pub struct Config {
         deserialize_with = "deserialize_vec_regex",
         serialize_with = "serialize_vec_regex"
     )]
+    pub service_priorities: Vec<(Regex, (Priority, bool))>,
+    #[serde(default)]
+    pub action_priorities: Option<ActionsPriorities>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
+    )]
     pub pub_heartbeat: Vec<(Regex, HeartbeatConfig)>,
     #[serde(
         default,
@@ -160,6 +168,40 @@ impl Config {
             }
         }
         None
+    }
+
+    pub fn get_priority_and_express_service(&self, ros2_name: &str) -> Option<(Priority, bool)> {
+        self.service_priorities
+            .iter()
+            .find(|(re, _)| re.is_match(ros2_name))
+            .map(|(_, p)| *p)
+    }
+
+    pub fn get_priority_and_express_action_send_goal(&self, ros2_name: &str) -> Option<(Priority, bool)> {
+        self.action_priorities
+            .as_ref()?
+            .send_goal
+            .iter()
+            .find(|(re, _)| re.is_match(ros2_name))
+            .map(|(_, p)| *p)
+    }
+
+    pub fn get_priority_and_express_action_cancel_goal(&self, ros2_name: &str) -> Option<(Priority, bool)> {
+        self.action_priorities
+            .as_ref()?
+            .cancel_goal
+            .iter()
+            .find(|(re, _)| re.is_match(ros2_name))
+            .map(|(_, p)| *p)
+    }
+
+    pub fn get_priority_and_express_action_get_result(&self, ros2_name: &str) -> Option<(Priority, bool)> {
+        self.action_priorities
+            .as_ref()?
+            .get_result
+            .iter()
+            .find(|(re, _)| re.is_match(ros2_name))
+            .map(|(_, p)| *p)
     }
 
     pub fn get_queries_timeout_tl_sub(&self, ros2_name: &str) -> Duration {
@@ -337,6 +379,28 @@ pub struct ActionsTimeouts {
         serialize_with = "serialize_vec_regex"
     )]
     get_result: Vec<(Regex, f32)>,
+}
+
+#[derive(Deserialize, Debug, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ActionsPriorities {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
+    )]
+    send_goal: Vec<(Regex, (Priority, bool))>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
+    )]
+    cancel_goal: Vec<(Regex, (Priority, bool))>,
+    #[serde(
+        deserialize_with = "deserialize_vec_regex",
+        serialize_with = "serialize_vec_regex"
+    )]
+    get_result: Vec<(Regex, (Priority, bool))>,
 }
 
 #[derive(Deserialize, Debug, Serialize)]

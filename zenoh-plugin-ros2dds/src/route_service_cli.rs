@@ -31,10 +31,10 @@ use zenoh::{
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
     query::{Querier, Reply},
+    qos::Priority,
     sample::Locality,
     Wait,
 };
-
 use crate::{
     dds_types::{DDSRawSample, TypeInfo},
     dds_utils::{
@@ -107,10 +107,12 @@ impl RouteServiceCli {
         zenoh_key_expr: OwnedKeyExpr,
         type_info: Option<Arc<TypeInfo>>,
         queries_timeout: Duration,
+        priority: Priority,
+        is_express: bool,
         context: Context,
     ) -> Result<RouteServiceCli, String> {
         tracing::debug!(
-            "Route Service Client (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr}): creation with type {ros2_type} (queries_timeout={queries_timeout:#?})"
+            "Route Service Client (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr}): creation with type {ros2_type} (queries_timeout={queries_timeout:#?}, priority={priority:#?}, is_express={is_express:#?})"
         );
 
         let zenoh_querier: Arc<Querier<'static>> = Arc::new(
@@ -120,6 +122,8 @@ impl RouteServiceCli {
                 .congestion_control(zenoh::qos::CongestionControl::Block)
                 .allowed_destination(Locality::Remote)
                 .timeout(queries_timeout)
+                .priority(priority)
+                .express(is_express)
                 .await
                 .map_err(|e| format!("Failed create Querier for key {zenoh_key_expr}: {e}",))?,
         );

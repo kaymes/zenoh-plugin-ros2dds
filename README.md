@@ -257,7 +257,7 @@ NOTE: the bridge prefixes ALL topics/services/actions names with the configured 
 ## Quality of service (QoS) settings
 
 Zenoh and DDS have different quality of service (QoS) concepts which don't always map one-to-one between the two worlds.
-Thus, when bridging DDS entities with the `zenoh-bridge-ros2dds`, some subtle differences in behaviour may arise.
+Thus, when bridging DDS entities with `zenoh-bridge-ros2dds`, some subtle differences in behaviour may arise.
 
 The bridge attempts to set up its DDS publishers and subscribers as well as the internal Zenoh transports to match the 
 QoS settings observed in the DDS entities. However, if different DDS entities for the same topic have different QoS 
@@ -284,7 +284,7 @@ The default of `zenoh-bridge-ros2dds` is to map reliable ROS topis to Zenoh's re
 is the closest match to the DDS behaviour.
 
 Congestion control `Block` is expected to work well in local area network (LAN) settings where the underlying network is
-failry reliable with a predictable bandwidth. However, if the underlying network is unreliable with inconsistent bandwith
+fairly reliable with a predictable bandwidth. However, if the underlying network is unreliable with inconsistent bandwidth
 availability, congestion on one link of a route of the Zenoh network can build up backpressure that affects the throughput 
 of otherwise unrelated routes. Furthermore, if congestion causes Zenoh routers to sever their connection, all traffic 
 between the affected routers ceases until the connection is restored. Thus, when operating `zenoh-bridge-ros2dds` on wide

@@ -673,8 +673,12 @@ impl RoutesMgr {
             Entry::Vacant(entry) => {
                 // ROS2 topic name => Zenoh key expr : strip '/' prefix
                 let zenoh_key_expr = ros2_name_to_key_expr(&ros2_name, &self.context.config);
-                // configured queries timeout for services calls
+                // configured queries timeout and priority settings for services calls
                 let queries_timeout = self.context.config.get_queries_timeout_service(&ros2_name);
+                let (priority, is_express) = self.context
+                    .config
+                    .get_priority_and_express_service(&ros2_name)
+                    .unwrap_or_default();
                 // create route
                 let route = RouteServiceCli::create(
                     ros2_name.clone(),
@@ -682,6 +686,8 @@ impl RoutesMgr {
                     zenoh_key_expr.clone(),
                     None,
                     queries_timeout,
+                    priority,
+                    is_express,
                     self.context.clone(),
                 )
                 .await?;
