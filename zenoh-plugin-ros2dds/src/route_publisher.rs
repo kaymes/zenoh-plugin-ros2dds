@@ -16,7 +16,7 @@ use std::{
     collections::HashSet,
     fmt,
     ops::Deref,
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -43,7 +43,6 @@ use crate::{
     liveliness_mgt::new_ke_liveliness_pub,
     qos_helpers::*,
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
-    ros_discovery::RosDiscoveryInfoMgr,
     routes_mgr::Context,
     Config, LOG_PAYLOAD,
 };
@@ -85,6 +84,9 @@ pub struct RoutePublisher {
     // the local DDS Reader created to serve the route (i.e. re-publish to zenoh message coming from DDS)
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     dds_reader: Arc<AtomicDDSEntity>,
+    // keeps the DDS Reader in line with the demand for this route (see ReaderControl)
+    #[serde(skip)]
+    reader_control: Arc<ReaderControl>,
     // the Zenoh Priority for publications
     #[serde(serialize_with = "serialize_priority")]
     priority: Priority,
@@ -110,7 +112,8 @@ pub struct RoutePublisher {
 
 impl Drop for RoutePublisher {
     fn drop(&mut self) {
-        self.deactivate_dds_reader();
+        self.reader_control
+            .update("route dropped", |demand| demand.closed = true);
     }
 }
 
@@ -260,43 +263,33 @@ impl RoutePublisher {
                 .map_err(|e| format!("Failed create Publisher for key {zenoh_key_expr}: {e}",))?,
         );
 
-        // activate/deactivate DDS Reader on detection/undetection of matching Subscribers
-        // (copy/move all required args for the callback)
+        // activate/deactivate the DDS Reader depending on the demand for this route:
+        // the zenoh matching status of the Publisher and the remote routes announced via liveliness
         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let route_id = format!("Route Publisher (ROS:{ros2_name} -> Zenoh:{zenoh_key_expr})");
+        let reader_control = Arc::new(ReaderControl {
+            route_id: route_id.clone(),
+            ros2_name: ros2_name.clone(),
+            ros2_type: ros2_type.clone(),
+            keyless,
+            reader_qos: reader_qos.clone(),
+            type_info: type_info.clone(),
+            context: context.clone(),
+            // weak, to not keep the Publisher (and its matching listener) alive forever
+            publisher: Arc::downgrade(&publisher),
+            dds_reader: dds_reader.clone(),
+            demand: Mutex::new(ReaderDemand::default()),
+        });
 
         publisher
             .matching_listener()
             .callback({
-                let dds_reader = dds_reader.clone();
-                let ros2_name = ros2_name.clone();
-                let ros2_type = ros2_type.clone();
-                let zenoh_key_expr = zenoh_key_expr.clone();
-                let route_id =
-                    format!("Route Publisher (ROS:{ros2_name} -> Zenoh:{zenoh_key_expr})");
-                let context = context.clone();
-                let reader_qos = reader_qos.clone();
-                let type_info = type_info.clone();
-                let publisher = publisher.clone();
-
+                let reader_control = reader_control.clone();
                 move |status| {
                     tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
-                    if status.matching() {
-                        if let Err(e) = activate_dds_reader(
-                            &dds_reader,
-                            &ros2_name,
-                            &ros2_type,
-                            &route_id,
-                            &context,
-                            keyless,
-                            &reader_qos,
-                            &type_info,
-                            &publisher,
-                        ) {
-                            tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
-                        }
-                    } else {
-                        deactivate_dds_reader(&dds_reader, &route_id, &context.ros_discovery_mgr)
-                    }
+                    reader_control.update("matching status changed", |demand| {
+                        demand.matching = status.matching()
+                    });
                 }
             })
             .background()
@@ -313,6 +306,7 @@ impl RoutePublisher {
                 cache_size,
             },
             dds_reader,
+            reader_control,
             priority,
             _type_info: type_info.clone(),
             _reader_qos: reader_qos,
@@ -321,20 +315,6 @@ impl RoutePublisher {
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
         })
-    }
-
-    fn deactivate_dds_reader(&mut self) {
-        let dds_reader = self.dds_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
-        if dds_reader != DDS_ENTITY_NULL {
-            // remove reader's GID from ros_discovery_info message
-            match get_guid(&dds_reader) {
-                Ok(gid) => self.context.ros_discovery_mgr.remove_dds_reader(gid),
-                Err(e) => tracing::warn!("{self}: {e}"),
-            }
-            if let Err(e) = delete_dds_entity(dds_reader) {
-                tracing::warn!("{}: error deleting DDS Reader:  {}", self, e);
-            }
-        }
     }
 
     async fn announce_route(&mut self, discovered_writer_qos: &Qos) -> Result<(), String> {
@@ -372,6 +352,7 @@ impl RoutePublisher {
         self.remote_routes
             .insert(format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        self.update_reader_demand();
     }
 
     #[inline]
@@ -379,10 +360,16 @@ impl RoutePublisher {
         self.remote_routes
             .remove(&format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
-        // if last remote route removed, deactivate the DDS Reader
-        if self.remote_routes.is_empty() {
-            self.deactivate_dds_reader();
-        }
+        self.update_reader_demand();
+    }
+
+    // Tell the ReaderControl how many remote routes this route serves. It creates or deletes the
+    // DDS Reader if that changes whether the Reader is needed.
+    fn update_reader_demand(&self) {
+        let remote_routes = self.remote_routes.len();
+        self.reader_control.update("remote routes changed", |demand| {
+            demand.remote_routes = remote_routes
+        });
     }
 
     #[inline]
@@ -446,69 +433,146 @@ fn get_read_period(config: &Config, ros2_name: &str) -> Option<Duration> {
         .map(|f| Duration::from_secs_f32(1f32 / f))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn activate_dds_reader(
-    dds_reader: &Arc<AtomicDDSEntity>,
-    ros2_name: &str,
-    ros2_type: &str,
-    route_id: &str,
-    context: &Context,
+/// What keeps the DDS Reader of a RoutePublisher alive.
+///
+/// The Reader is needed as long as there is a zenoh Subscriber matching the Publisher
+/// or a remote bridge announced (via liveliness) a Subscriber route for it.
+/// Both signals are only used to update this state, the Reader is then created or deleted
+/// so that it follows the state. The signals arrive on different threads and in no
+/// guaranteed order, and the matching status does not always change when the remote
+/// routes do (e.g. the bridge's own zenoh Subscriber on the same key counts as a match).
+/// Reacting to each signal on its own therefore left routes without a Reader forever.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReaderDemand {
+    // zenoh matching status of the Publisher
+    matching: bool,
+    // number of remote routes (announced by liveliness) served by the route
+    remote_routes: usize,
+    // the route is dropped: no more Reader
+    closed: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReaderAction {
+    Create,
+    Delete,
+    Keep,
+}
+
+impl ReaderDemand {
+    fn reader_needed(&self) -> bool {
+        !self.closed && (self.matching || self.remote_routes > 0)
+    }
+
+    fn action(&self, has_reader: bool) -> ReaderAction {
+        match (self.reader_needed(), has_reader) {
+            (true, false) => ReaderAction::Create,
+            (false, true) => ReaderAction::Delete,
+            _ => ReaderAction::Keep,
+        }
+    }
+}
+
+struct ReaderControl {
+    route_id: String,
+    ros2_name: String,
+    ros2_type: String,
     keyless: bool,
-    reader_qos: &Qos,
-    type_info: &Option<Arc<TypeInfo>>,
-    publisher: &Arc<AdvancedPublisher<'static>>,
-) -> Result<(), String> {
-    tracing::debug!("{route_id}: create Reader with {reader_qos:?}");
-    let topic_name: String = format!("rt{}", ros2_name);
-    let type_name = ros2_message_type_to_dds_type(ros2_type);
-    let read_period = get_read_period(&context.config, ros2_name);
+    reader_qos: Qos,
+    type_info: Option<Arc<TypeInfo>>,
+    context: Context,
+    publisher: Weak<AdvancedPublisher<'static>>,
+    // the DDS Reader of the route (DDS_ENTITY_NULL if none), shared with RoutePublisher for the admin space
+    dds_reader: Arc<AtomicDDSEntity>,
+    // serializes all changes: the lock is held while the Reader is created or deleted
+    demand: Mutex<ReaderDemand>,
+}
 
-    // create matching DDS Reader that forwards message coming from DDS to Zenoh
-    let reader = create_dds_reader(
-        context.participant,
-        topic_name.clone(),
-        type_name,
-        type_info,
-        keyless,
-        reader_qos.clone(),
-        read_period,
-        {
-            let route_id = route_id.to_string();
-            let publisher = publisher.clone();
-            move |sample: &DDSRawSample| {
-                route_dds_message_to_zenoh(sample, &publisher, &route_id);
+impl ReaderControl {
+    // Change the demand and create or delete the DDS Reader accordingly.
+    fn update(&self, reason: &str, change: impl FnOnce(&mut ReaderDemand)) {
+        let mut demand = self.demand.lock().unwrap_or_else(|e| e.into_inner());
+        change(&mut demand);
+        let has_reader = self.dds_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL;
+        match demand.action(has_reader) {
+            ReaderAction::Create => {
+                tracing::debug!("{}: DDS Reader needed ({reason}: {:?})", self.route_id, *demand);
+                if let Err(e) = self.activate_dds_reader() {
+                    // the next change of the demand will retry
+                    tracing::error!("{}: failed to activate DDS Reader: {e}", self.route_id);
+                }
             }
-        },
-    )?;
-    let old = dds_reader.deref().swap(reader, Ordering::Relaxed);
-    // add reader's GID in ros_discovery_info message
-    context.ros_discovery_mgr.add_dds_reader(get_guid(&reader)?);
-
-    if old != DDS_ENTITY_NULL {
-        tracing::warn!("{route_id}: on activation their was already a DDS Reader - overwrite it");
-        if let Err(e) = delete_dds_entity(old) {
-            tracing::warn!("{route_id}: failed to delete overwritten DDS Reader: {e}");
+            ReaderAction::Delete => {
+                tracing::debug!("{}: DDS Reader not needed anymore ({reason}: {:?})", self.route_id, *demand);
+                self.deactivate_dds_reader();
+            }
+            ReaderAction::Keep => {
+                tracing::trace!(
+                    "{}: DDS Reader unchanged ({reason}: {:?}, has_reader: {has_reader})",
+                    self.route_id,
+                    *demand
+                );
+            }
         }
     }
 
-    Ok(())
-}
-
-fn deactivate_dds_reader(
-    dds_reader: &Arc<AtomicDDSEntity>,
-    route_id: &str,
-    ros_discovery_mgr: &Arc<RosDiscoveryInfoMgr>,
-) {
-    tracing::debug!("{route_id}: delete Reader");
-    let reader = dds_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
-    if reader != DDS_ENTITY_NULL {
-        // remove reader's GID from ros_discovery_info message
-        match get_guid(&reader) {
-            Ok(gid) => ros_discovery_mgr.remove_dds_reader(gid),
-            Err(e) => tracing::warn!("{route_id}: {e}"),
+    fn activate_dds_reader(&self) -> Result<(), String> {
+        let route_id = &self.route_id;
+        if self.publisher.strong_count() == 0 {
+            tracing::debug!("{route_id}: Publisher is gone - not creating DDS Reader");
+            return Ok(());
         }
-        if let Err(e) = delete_dds_entity(reader) {
-            tracing::warn!("{route_id}: error deleting DDS Reader:  {e}");
+        tracing::debug!("{route_id}: create Reader with {:?}", self.reader_qos);
+        let topic_name: String = format!("rt{}", self.ros2_name);
+        let type_name = ros2_message_type_to_dds_type(&self.ros2_type);
+        let read_period = get_read_period(&self.context.config, &self.ros2_name);
+
+        // create matching DDS Reader that forwards message coming from DDS to Zenoh
+        let reader = create_dds_reader(
+            self.context.participant,
+            topic_name,
+            type_name,
+            &self.type_info,
+            self.keyless,
+            self.reader_qos.clone(),
+            read_period,
+            {
+                let route_id = route_id.clone();
+                let publisher = self.publisher.clone();
+                move |sample: &DDSRawSample| {
+                    if let Some(publisher) = publisher.upgrade() {
+                        route_dds_message_to_zenoh(sample, &publisher, &route_id);
+                    }
+                }
+            },
+        )?;
+        let old = self.dds_reader.swap(reader, Ordering::Relaxed);
+        // add reader's GID in ros_discovery_info message
+        self.context.ros_discovery_mgr.add_dds_reader(get_guid(&reader)?);
+
+        if old != DDS_ENTITY_NULL {
+            tracing::warn!("{route_id}: on activation their was already a DDS Reader - overwrite it");
+            if let Err(e) = delete_dds_entity(old) {
+                tracing::warn!("{route_id}: failed to delete overwritten DDS Reader: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn deactivate_dds_reader(&self) {
+        let route_id = &self.route_id;
+        tracing::debug!("{route_id}: delete Reader");
+        let reader = self.dds_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
+        if reader != DDS_ENTITY_NULL {
+            // remove reader's GID from ros_discovery_info message
+            match get_guid(&reader) {
+                Ok(gid) => self.context.ros_discovery_mgr.remove_dds_reader(gid),
+                Err(e) => tracing::warn!("{route_id}: {e}"),
+            }
+            if let Err(e) = delete_dds_entity(reader) {
+                tracing::warn!("{route_id}: error deleting DDS Reader:  {e}");
+            }
         }
     }
 }
@@ -525,5 +589,65 @@ fn route_dds_message_to_zenoh(
     }
     if let Err(e) = publisher.put(sample).wait() {
         tracing::error!("{route_id}: failed to route message: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReaderAction::*, ReaderDemand};
+
+    fn demand(matching: bool, remote_routes: usize) -> ReaderDemand {
+        ReaderDemand {
+            matching,
+            remote_routes,
+            closed: false,
+        }
+    }
+
+    #[test]
+    fn reader_follows_demand() {
+        assert_eq!(demand(false, 0).action(false), Keep);
+        assert_eq!(demand(true, 0).action(false), Create);
+        assert_eq!(demand(false, 1).action(false), Create);
+        assert_eq!(demand(true, 2).action(true), Keep);
+        assert_eq!(demand(false, 0).action(true), Delete);
+    }
+
+    // Regression test for stale topics: the zenoh matching status stays true while the remote
+    // routes drop to zero and come back (e.g. a remote bridge reconnects while the bridge has its
+    // own zenoh Subscriber on the same key). The Reader has to be there afterwards.
+    #[test]
+    fn reader_survives_remote_bridge_reconnect_without_matching_change() {
+        let mut has_reader = false;
+        let mut apply = |d: ReaderDemand| {
+            match d.action(has_reader) {
+                Create => has_reader = true,
+                Delete => has_reader = false,
+                Keep => {}
+            }
+            has_reader
+        };
+        assert!(apply(demand(true, 0))); // matching: created
+        assert!(apply(demand(true, 2))); // remote routes announced
+        assert!(apply(demand(true, 0))); // remote bridge drops: still matching, keep Reader
+        assert!(apply(demand(true, 1))); // remote bridge is back
+    }
+
+    #[test]
+    fn reader_created_when_remote_route_is_announced_before_matching() {
+        assert_eq!(demand(false, 1).action(false), Create);
+        assert_eq!(demand(true, 1).action(true), Keep);
+        assert_eq!(demand(false, 0).action(true), Delete);
+    }
+
+    #[test]
+    fn closed_route_deletes_reader_and_never_creates_one() {
+        let closed = ReaderDemand {
+            matching: true,
+            remote_routes: 3,
+            closed: true,
+        };
+        assert_eq!(closed.action(true), Delete);
+        assert_eq!(closed.action(false), Keep);
     }
 }
