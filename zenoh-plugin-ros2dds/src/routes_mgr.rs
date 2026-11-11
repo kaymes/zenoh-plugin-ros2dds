@@ -509,7 +509,7 @@ impl RoutesMgr {
                     route.remove_remote_route(&zenoh_id, &zenoh_key_expr);
                     if route.is_unused() {
                         self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_CLI / &zenoh_key_expr));
+                            .remove(&(*KE_PREFIX_ROUTE_ACTION_CLI / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -544,7 +544,7 @@ impl RoutesMgr {
                     route.remove_remote_route(&zenoh_id, &zenoh_key_expr);
                     if route.is_unused() {
                         self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_SRV / &zenoh_key_expr));
+                            .remove(&(*KE_PREFIX_ROUTE_ACTION_SRV / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
