@@ -17,7 +17,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, Weak,
     },
     time::Duration,
 };
@@ -81,10 +81,18 @@ pub struct RouteServiceCli {
     remote_routes: HashSet<String>,
     // the list of nodes served by this route
     local_nodes: HashSet<String>,
+    // true once the route is dropped. The lock serializes the creation/deletion of the DDS Reader
+    // and Writer between the matching listener and the drop of the route, so that the listener
+    // can never (re)create them for a route that is gone.
+    #[serde(skip)]
+    closed: Arc<Mutex<bool>>,
 }
 
 impl Drop for RouteServiceCli {
     fn drop(&mut self) {
+        let closed = self.closed.clone();
+        let mut closed = closed.lock().unwrap_or_else(|e| e.into_inner());
+        *closed = true;
         self.deactivate();
     }
 }
@@ -135,6 +143,8 @@ impl RouteServiceCli {
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
 
+        let closed: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+
         zenoh_querier
             .matching_listener()
             .callback({
@@ -143,10 +153,19 @@ impl RouteServiceCli {
                 let ros2_name = ros2_name.clone();
                 let ros2_type = ros2_type.clone();
                 let context = context.clone();
-                let zquerier = zenoh_querier.clone();
+                // weak, to not keep the Querier (and its matching listener) alive forever
+                // after the route is dropped
+                let zquerier = Arc::downgrade(&zenoh_querier);
+                let closed = closed.clone();
 
                 move |status| {
                         tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
+                        // hold the lock while creating/deleting the DDS entities (see Drop)
+                        let closed = closed.lock().unwrap_or_else(|e| e.into_inner());
+                        if *closed {
+                            tracing::debug!("{route_id}: route dropped - ignoring MatchingStatus change");
+                            return;
+                        }
                         if status.matching() {
                             if let Err(e) = activate(
                                 &rep_writer,
@@ -186,6 +205,7 @@ impl RouteServiceCli {
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
+            closed,
         })
     }
 
@@ -299,7 +319,7 @@ fn activate(
     route_id: &str,
     context: &Context,
     type_info: &Option<Arc<TypeInfo>>,
-    zenoh_querier: &Arc<Querier<'static>>,
+    zenoh_querier: &Weak<Querier<'static>>,
 ) -> Result<(), String> {
     tracing::debug!("{route_id}: activate");
     // Default Service QoS
@@ -354,7 +374,9 @@ fn activate(
         qos,
         None,
         move |sample| {
-            route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer);
+            if let Some(zquerier) = zquerier.upgrade() {
+                route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer);
+            }
         },
     )?;
     let old = req_reader.swap(dds_reader, Ordering::Relaxed);
