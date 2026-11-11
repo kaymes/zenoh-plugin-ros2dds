@@ -245,10 +245,11 @@ impl RouteServiceCli {
         self.remote_routes
             .remove(&format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self}: now serving remote routes {:?}", self.remote_routes);
-        // if last remote node removed, deactivate the route
-        if self.remote_routes.is_empty() {
-            self.deactivate();
-        }
+        // Do NOT deactivate the DDS Reader/Writer here, even if there is no remote route left:
+        // they are created and deleted only by the Querier's matching listener. The liveliness
+        // events that update `remote_routes` and the matching status are not ordered, and
+        // deleting here while the matching status stays `true` left the route without
+        // Reader/Writer forever (the service disappeared from ROS).
     }
 
     #[inline]
